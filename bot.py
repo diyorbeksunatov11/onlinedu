@@ -15,12 +15,16 @@ import asyncio
 import json
 import logging
 import os
+import time
+import shutil
+import zipfile
 import random
 import re
 import sqlite3
 import string
 import html
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
 
 
@@ -55,14 +59,42 @@ from aiogram.fsm.state import State, StatesGroup
 
 # ---- PDF (fpdf) ----
 from fpdf import FPDF
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+UZ_TZ = ZoneInfo("Asia/Tashkent")
+
+def to_uz_time_str(dt_value) -> str:
+    """Convert DB datetime (str/datetime) to Uzbekistan time string YYYY-MM-DD HH:MM."""
+    if dt_value is None:
+        return ""
+    if isinstance(dt_value, datetime):
+        dt = dt_value
+    else:
+        s = str(dt_value).strip()
+        if not s:
+            return ""
+        s2 = s.replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(s2)
+        except Exception:
+            try:
+                dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return s
+    if dt.tzinfo is None:
+        # store naive timestamps as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(UZ_TZ).strftime("%Y-%m-%d %H:%M")
+
 
 # =========================
 # CONFIG (yours; can be fake)
 # =========================
-API_TOKEN = "8460895498:AAE1eqkVmt6CY5m5oFyZE0y1z8rLTecAlCM"
+API_TOKEN = os.getenv("BOT_TOKEN", "")  # set in hosting env
+# fallback for local dev (optional): set BOT_TOKEN in env
 SUPER_ADMIN_ID = 7880323063
-DB_NAME = "test_educenter.db"
-
+DB_NAME = os.getenv("DB_PATH", "test_educenter.db")
 # =========================
 # LOGGING
 # =========================
@@ -127,6 +159,28 @@ def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_attendance_schema(conn: sqlite3.Connection) -> None:
+    """Ensure attendance tables exist (safe to call often). Helps after DB restore/migrations."""
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS attendance_archive(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER,
+        user_id INTEGER,
+        att_date TEXT,
+        status TEXT,
+        note TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS attendance_days(
+        group_id INTEGER,
+        att_date TEXT,
+        saved_at TEXT,
+        saved_by INTEGER,
+        PRIMARY KEY(group_id, att_date)
+    )""")
+    conn.commit()
 
 
 
@@ -207,25 +261,23 @@ def kb_home_admin(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_std_nav(is_admin: bool) -> InlineKeyboardMarkup:
+    """Standard navigation: Back + Menu on one line."""
     if is_admin:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:back")],
-            [InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")]
+            [InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:back"),
+             InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Ortga", callback_data="u:back")],
-        [InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")]
+        [InlineKeyboardButton(text="⬅️ Ortga", callback_data="u:back"),
+         InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")]
     ])
 
 
 def kb_back_home(back_cb: str = "a:home") -> InlineKeyboardMarkup:
-    """Inline navigation: Back + Home (admin callbacks).
-
-    back_cb should be a valid callback_data. Defaults to a safe "a:home".
-    """
+    """Inline navigation: Back + Menu on one line (admin callbacks)."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Ortga", callback_data=back_cb)],
-        [InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")],
+        [InlineKeyboardButton(text="⬅️ Ortga", callback_data=back_cb),
+         InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")],
     ])
 
 # =========================
@@ -250,6 +302,29 @@ def migrate_task_submissions_columns(conn: sqlite3.Connection) -> None:
     if "graded_by" not in cols:
         c.execute("ALTER TABLE task_submissions ADD COLUMN graded_by INTEGER")
 
+
+
+
+def ensure_attendance_schema(conn) -> None:
+    """Ensure attendance tables exist for older DBs or after restore."""
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS attendance_archive(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER,
+        user_id INTEGER,
+        att_date TEXT,
+        status TEXT,
+        note TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS attendance_days(
+        group_id INTEGER,
+        att_date TEXT,
+        saved_at TEXT,
+        saved_by INTEGER,
+        PRIMARY KEY(group_id, att_date)
+    )""")
+    conn.commit()
 
 def init_db() -> None:
     conn = db()
@@ -334,6 +409,14 @@ def init_db() -> None:
             UNIQUE(group_id, user_id, att_date)
         )""")
 
+    # Attendance days archive (a day is considered "saved/finalized" when admin presses Save/Report/DM)
+    c.execute("""CREATE TABLE IF NOT EXISTS attendance_days(
+        group_id INTEGER,
+        att_date TEXT,
+        saved_at TEXT,
+        saved_by INTEGER,
+        PRIMARY KEY(group_id, att_date)
+    )""")
     # Counters
     c.execute("""CREATE TABLE IF NOT EXISTS counters(
             group_id INTEGER,
@@ -458,6 +541,305 @@ async def guard_msg(message, perm: Optional[str] = None) -> bool:
         return False
     return True
 
+
+
+def get_all_admin_ids() -> List[int]:
+    """Return all admin user IDs including SUPER_ADMIN_ID."""
+    ids: List[int] = []
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT user_id FROM admins").fetchall()
+            ids = [int(r["user_id"]) for r in rows if r and r["user_id"] is not None]
+    except Exception:
+        ids = []
+    if SUPER_ADMIN_ID not in ids:
+        ids.insert(0, int(SUPER_ADMIN_ID))
+    # de-dup while preserving order
+    seen = set()
+    out: List[int] = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def make_db_snapshot_zip() -> Tuple[str, str]:
+    """Create a consistent sqlite snapshot and return (zip_path, caption). Raises on failure."""
+    db_path = os.path.abspath(DB_NAME)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"DB topilmadi: {db_path}")
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    snap_path = f"/tmp/backup_{ts}_{os.path.basename(db_path)}"
+    zip_path = f"/tmp/backup_{ts}_{os.path.basename(db_path)}.zip"
+
+    # create snapshot
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(snap_path)
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    # zip it (often smaller + safer)
+    import zipfile
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.write(snap_path, arcname=os.path.basename(db_path))
+
+    try:
+        os.remove(snap_path)
+    except Exception:
+        pass
+
+    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    caption = (
+        f"✅ DB backup: <b>{escape_html(os.path.basename(db_path))}</b>\n"
+        f"📦 ZIP hajm: <b>{size_mb:.1f} MB</b>\n"
+        f"🕒 {escape_html(now_str())}"
+    )
+    return zip_path, caption
+
+
+async def send_db_backup_to_admins(bot: Bot, reason: str = "scheduled"):
+    """Send DB backup to all admins (DM). Never raises."""
+    try:
+        zip_path, caption = make_db_snapshot_zip()
+    except Exception as e:
+        # if snapshot failed, notify super admin only
+        try:
+            await bot.send_message(int(SUPER_ADMIN_ID), f"❌ DB backup xatolik ({escape_html(reason)}): <code>{escape_html(e)}</code>")
+        except Exception:
+            pass
+        return
+
+    # Telegram bot file size limits exist; try anyway, but warn if huge.
+    try:
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        if size_mb > 45:
+            warn = f"⚠️ Backup fayl juda katta: <b>{size_mb:.1f} MB</b>. Telegram limitiga urilishi mumkin."
+        else:
+            warn = ""
+    except Exception:
+        warn = ""
+
+    ids = get_all_admin_ids()
+    for uid in ids:
+        try:
+            await bot.send_document(
+                chat_id=int(uid),
+                document=FSInputFile(zip_path, filename=os.path.basename(zip_path)),
+                caption=(caption + (("\n\n" + warn) if warn else ""))
+            )
+        except Exception:
+            # ignore per-admin failures (blocked bot, etc.)
+            pass
+
+    try:
+        os.remove(zip_path)
+    except Exception:
+        pass
+
+
+def seconds_until_next_backup(hour: int = 6, minute: int = 0, tz_name: str = "Asia/Samarkand") -> int:
+    """Seconds until next scheduled time in given timezone."""
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return max(1, int((target - now).total_seconds()))
+
+
+# =========================
+# ADMIN: DB BACKUP (download SQLite file)
+# =========================
+@router.message(Command("backup_db"))
+async def cmd_backup_db(message: Message):
+    """Send current SQLite DB backup (zip) to admin as a document."""
+    if not await guard_msg(message, "admins"):
+        return
+    try:
+        zip_path, caption = make_db_snapshot_zip()
+    except Exception as e:
+        await message.reply(f"❌ Backup qilishda xatolik: <code>{escape_html(e)}</code>")
+        return
+
+    # Prefer sending to admin private chat (safer), fallback to current chat
+    target_chat_id = message.from_user.id
+    try:
+        await message.bot.send_document(
+            chat_id=target_chat_id,
+            document=FSInputFile(zip_path, filename=os.path.basename(zip_path)),
+            caption=caption
+        )
+        if message.chat.id != target_chat_id:
+            await message.reply("✅ Backup shaxsiy chatga yuborildi (DM).")
+    except Exception:
+        try:
+            await message.answer_document(
+                document=FSInputFile(zip_path, filename=os.path.basename(zip_path)),
+                caption=caption
+            )
+        except Exception as e:
+            await message.reply(f"❌ Fayl yuborilmadi: <code>{escape_html(e)}</code>")
+    finally:
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
+
+
+# =========================
+# ADMIN: DB RESTORE (upload SQLite file)
+# =========================
+def _is_sqlite_file(p: str) -> bool:
+    try:
+        with open(p, "rb") as f:
+            head = f.read(16)
+        return head.startswith(b"SQLite format 3\x00")
+    except Exception:
+        return False
+
+
+def _restore_db_from_path(src_path: str) -> str:
+    """Restore DB from .db or .zip containing a .db. Returns restored db filename."""
+    db_path = os.path.abspath(DB_NAME)
+
+    tmp_db = None
+    cleanup = []
+
+    # If zip: extract first *.db
+    if src_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(src_path, "r") as z:
+            cand = [n for n in z.namelist() if n.lower().endswith(".db")]
+            if not cand:
+                raise ValueError("ZIP ichida .db topilmadi.")
+            name = cand[0]
+            tmp_db = f"/tmp/restore_{int(time.time())}_{os.path.basename(name)}"
+            z.extract(name, "/tmp")
+            extracted = os.path.join("/tmp", name)
+            # zip may contain dirs
+            if os.path.isdir(extracted):
+                raise ValueError("ZIP format noto‘g‘ri.")
+            os.replace(extracted, tmp_db)
+            cleanup.append(tmp_db)
+    else:
+        tmp_db = src_path
+
+    if not _is_sqlite_file(tmp_db):
+        raise ValueError("Bu fayl SQLite DB emas (header mos emas).")
+
+    # Replace atomically
+    new_path = db_path + ".new"
+    shutil.copyfile(tmp_db, new_path)
+    os.replace(new_path, db_path)
+
+    for p in cleanup:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+    return os.path.basename(db_path)
+
+
+# --- Restore FSM state (must be defined before handlers) ---
+class RestoreState(StatesGroup):
+    waiting_file = State()
+
+
+@router.message(Command("restore_db"))
+async def cmd_restore_db(message: Message, state: FSMContext):
+    """Ask admin to upload a .zip/.db to restore."""
+    if not await guard_msg(message, "admins"):
+        return
+    await state.set_state(RestoreState.waiting_file)
+    await message.reply(
+        "♻️ <b>DB Restore</b>\n"
+        "Menga <b>.zip</b> (ichida .db) yoki to‘g‘ridan-to‘g‘ri <b>.db</b> fayl yuboring.\n"
+        "⚠️ Bu amaliyot mavjud bazani <b>butunlay almashtiradi</b>.\n"
+        "Bekor qilish: /cancel"
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur == RestoreState.waiting_file.state:
+        await state.clear()
+        await message.reply("✅ Bekor qilindi.")
+        return
+
+
+@router.message(RestoreState.waiting_file, F.document)
+async def restore_db_document(message: Message, state: FSMContext):
+    if not await guard_msg(message, "admins"):
+        return
+
+    # Safety: backup current DB before restore
+    try:
+        pre_zip, pre_cap = make_db_snapshot_zip()
+        try:
+            await message.bot.send_document(
+                chat_id=message.from_user.id,
+                document=FSInputFile(pre_zip, filename=os.path.basename(pre_zip)),
+                caption=(pre_cap + "\n\n⚠️ Restore’dan oldingi avtomatik backup (before_restore).")
+            )
+        finally:
+            try:
+                if os.path.exists(pre_zip):
+                    os.remove(pre_zip)
+            except Exception:
+                pass
+    except Exception:
+        # If backup fails, continue but warn
+        try:
+            await message.reply("⚠️ Restore’dan oldin backup olishda xatolik bo‘ldi, lekin davom etaman.")
+        except Exception:
+            pass
+
+    doc = message.document
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".db") or fname.endswith(".zip")):
+        await message.reply("❌ Faqat .db yoki .zip yuboring.")
+        return
+
+    tmp_path = f"/tmp/upload_{int(time.time())}_{doc.file_unique_id}_{os.path.basename(doc.file_name or 'db.zip')}"
+    try:
+        # aiogram v3 download helper
+        await message.bot.download(doc, destination=tmp_path)
+    except Exception as e:
+        await message.reply(f"❌ Faylni yuklab bo‘lmadi: <code>{escape_html(e)}</code>")
+        return
+
+    try:
+        restored = _restore_db_from_path(tmp_path)
+    except Exception as e:
+        await message.reply(f"❌ Restore xatolik: <code>{escape_html(e)}</code>")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    await state.clear()
+    await message.reply(
+        "✅ <b>DB tiklandi.</b>\n"
+        f"Fayl: <code>{escape_html(restored)}</code>\n"
+        "🔄 Endi hostingda <b>Restart</b> qiling (yoki servisni qayta ishga tushiring), shunda bot yangi DB bilan ishlaydi."
+    )
+
 def ensure_user(uid: int, name: str):
     conn = db()
     row = conn.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -504,8 +886,11 @@ class UState(StatesGroup):
     solve_answers = State()
     task_submit = State()
 
+
 class AState(StatesGroup):
-    # broadcast
+    waiting_file = State()
+
+    # global broadcast (any content: text or media)
     broadcast_any = State()
 
     # group create
@@ -598,11 +983,11 @@ def pdf_rating(filename: str, title: str, rows: List[Tuple[str, int, int, float,
 
         # Color bands (you requested: 85+ green, 65+ yellow, else red)
         if p >= 85:
-            pdf.set_fill_color(200, 255, 200)
+            pdf.set_fill_color(90, 220, 120)
         elif p >= 65:
-            pdf.set_fill_color(255, 255, 200)
+            pdf.set_fill_color(255, 215, 80)
         else:
-            pdf.set_fill_color(255, 210, 210)
+            pdf.set_fill_color(255, 110, 110)
 
         pdf.cell(12, 8, str(i), 1, 0, "C", True)
         pdf.cell(78, 8, pdf_safe(name)[:44], 1, 0, "L", True)
@@ -638,10 +1023,10 @@ def pdf_attendance(filename: str, group_name: str, date_s: str, rows: List[Tuple
     for i, (name, st) in enumerate(rows, 1):
         if st == "absent":
             pdf.set_fill_color(255, 210, 210)
-            label = "Kelmadi"
+            label = "Qatnashmadi"
         else:
             pdf.set_fill_color(200, 255, 200)
-            label = "Keldi"
+            label = "Qatnashdi"
         pdf.cell(10, 8, str(i), 1, 0, "C", True)
         pdf.cell(140, 8, safe_pdf_text(name)[:80], 1, 0, "L", True)
         pdf.cell(40, 8, safe_pdf_text(label), 1, 1, "C", True)
@@ -828,10 +1213,7 @@ async def u_group_tests(call: CallbackQuery):
 
     rows = tests_for_user_in_group(uid, gid)
     if not rows:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")],
-            [InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")],
-        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")]])
         await safe_edit(call, "Bu guruhda hozircha test yo‘q.", kb)
         return
 
@@ -843,8 +1225,7 @@ async def u_group_tests(call: CallbackQuery):
             text=f"{icon} {r['test_id']} ({status})",
             callback_data=f"u:solve_tid:{r['test_id']}"
         )])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
     await safe_edit(call, f"🧪 <b>{safe_pdf_text(g['name'])}</b> — Testlar:", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 # =========================
@@ -1133,8 +1514,7 @@ async def a_g_students(call: CallbackQuery):
     for i, s in enumerate(students, 1):
         text += f"{i}. {safe_pdf_text(s['full_name'])}\n"
         kb_rows.append([InlineKeyboardButton(text=f"❌ {s['full_name'][:18]}", callback_data=f"a:g_kick:{gid}:{s['user_id']}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -1302,9 +1682,14 @@ def group_students(gid: int) -> List[Tuple[int, str]]:
 async def a_g_att_menu(call: CallbackQuery):
     if not await guard(call, "attendance"):
         return
-    gid = int(call.data.split(":")[2])
-    d = today_str()
+    parts = call.data.split(":")
+    gid = int(parts[2])
+    d = parts[3] if len(parts) > 3 else today_str()
+    await _render_attendance_screen(call, gid, d)
 
+
+async def _render_attendance_screen(call: CallbackQuery, gid: int, d: str):
+    """Render attendance UI for group/date. Do NOT mutate call.data (CallbackQuery is frozen in aiogram v3)."""
     conn = db()
     g = conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
     conn.close()
@@ -1325,15 +1710,30 @@ async def a_g_att_menu(call: CallbackQuery):
             callback_data=f"a:att_t:{gid}:{uid}:{d}"
         )])
 
+    kb_rows.append([InlineKeyboardButton(text="✅ Saqlash", callback_data=f"a:att_save:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="📨 Yo‘qlarga DM yuborish", callback_data=f"a:att_send:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="📄 Hisobot (text)", callback_data=f"a:att_rep:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="📥 Hisobot (PDF)", callback_data=f"a:att_pdf:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="🗂 Arxiv", callback_data=f"a:att_arc:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"🗓 <b>Davomat</b>\nGuruh: <b>{safe_pdf_text(g['name'])}</b>\nSana: <code>{d}</code>\n\n"
-                          f"Faqat kelmaganlarni ❌ qilib belgilang.", InlineKeyboardMarkup(inline_keyboard=kb_rows))
+                          f"Faqat qatnashmaganlarni ❌ qilib belgilang.", InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("a:att:"))
+async def a_att_open(call: CallbackQuery):
+    # Open attendance for selected archived date
+    if not await guard(call, "attendance"):
+        return
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Xatolik.", show_alert=True)
+        return
+    gid = int(parts[2])
+    d = parts[3]
+    # Open the same attendance screen for archived date
+    await _render_attendance_screen(call, gid, d)
 
 @router.callback_query(F.data.startswith("a:att_t:"))
 async def a_att_toggle(call: CallbackQuery):
@@ -1369,6 +1769,10 @@ async def a_att_report_text(call: CallbackQuery):
     _, _, gid, d = call.data.split(":")
     gid = int(gid)
 
+    # save day to archive / apply kick limits (only once per date)
+    await finalize_attendance_day(call.bot, gid, d, saved_by=call.from_user.id, send_dm=False)
+
+
     conn = db()
     g = conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
     conn.close()
@@ -1385,15 +1789,15 @@ async def a_att_report_text(call: CallbackQuery):
             f"Guruh: <b>{safe_pdf_text(g['name'])}</b>\n"
             f"Sana: <code>{d}</code>\n\n"
             f"Jami: <b>{len(studs)}</b>\n"
-            f"✅ Keldi: <b>{present}</b>\n"
-            f"❌ Kelmadi: <b>{len(absent)}</b>\n\n")
+            f"✅ Qatnashdi: <b>{present}</b>\n"
+            f"❌ Qatnashmadi: <b>{len(absent)}</b>\n\n")
 
     if absent:
-        text += "❌ <b>KELMAGANLAR:</b>\n"
+        text += "❌ <b>QATNASHMAGANLAR:</b>\n"
         for i, (_uid, nm) in enumerate(absent, 1):
             text += f"{i}. {safe_pdf_text(nm)}\n"
     else:
-        text += "✅ Bugun hamma kelgan."
+        text += "✅ Bugun hamma qatnashgan."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 PDF", callback_data=f"a:att_pdf:{gid}:{d}")],
@@ -1408,6 +1812,10 @@ async def a_att_pdf(call: CallbackQuery):
         return
     _, _, gid, d = call.data.split(":")
     gid = int(gid)
+
+    # save day to archive / apply kick limits (only once per date)
+    await finalize_attendance_day(call.bot, gid, d, saved_by=call.from_user.id, send_dm=False)
+
 
     conn = db()
     g = conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
@@ -1430,6 +1838,83 @@ async def a_att_pdf(call: CallbackQuery):
         except:
             pass
 
+
+
+# ---------------- Attendance finalize / archive / auto-kick ----------------
+async def finalize_attendance_day(bot: Bot, gid: int, att_date: str, saved_by: int, *, send_dm: bool = False) -> dict:
+    """Finalize attendance day: record day into attendance_days (once), increment absent counters once, and auto-kick if limit reached.
+    If send_dm=True, DM absent users with their current counter (does not re-increment if already finalized)."""
+    conn = db()
+    g = conn.execute("SELECT id, name, tg_chat_id, att_absent_limit FROM groups WHERE id=?", (gid,)).fetchone()
+    conn.close()
+    if not g:
+        return {"ok": False, "error": "group_not_found"}
+
+    studs = group_students(gid)
+    amap = attendance_map(gid, att_date)
+    absent = [(uid, nm) for uid, nm in studs if amap.get(uid, "present") == "absent"]
+
+    conn = db()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO attendance_days(group_id, att_date, saved_at, saved_by) VALUES (?,?,?,?)",
+        (gid, att_date, now_str(), int(saved_by)),
+    )
+    conn.commit()
+    inserted = (cur.rowcount == 1)
+    conn.close()
+
+    sent = 0
+    kicked = 0
+
+    limit = int(g["att_absent_limit"] or 0)
+    if limit <= 0:
+        limit = 999999
+
+    for uid, nm in absent:
+        conn = db()
+        conn.execute("INSERT OR IGNORE INTO counters(group_id, user_id, absent_count, missed_task_count) VALUES (?,?,0,0)", (gid, uid))
+        if inserted:
+            conn.execute("UPDATE counters SET absent_count = absent_count + 1 WHERE group_id=? AND user_id=?", (gid, uid))
+        row = conn.execute("SELECT absent_count FROM counters WHERE group_id=? AND user_id=?", (gid, uid)).fetchone()
+        conn.commit()
+        conn.close()
+
+        cnt_abs = int(row["absent_count"]) if row else 0
+
+        if send_dm:
+            try:
+                await bot.send_message(
+                    uid,
+                    f"🗓 <b>Davomat ogohlantirish</b>\n"
+                    f"Guruh: <b>{safe_pdf_text(g['name'])}</b>\n"
+                    f"Sana: <code>{att_date}</code>\n\n"
+                    f"Siz bugun darsga qatnashmadingiz ❌\n"
+                    f"Sababsiz qoldirish: <b>{cnt_abs}/{limit}</b>",
+                )
+                sent += 1
+            except Exception:
+                pass
+
+        if inserted and cnt_abs >= limit:
+            conn = db()
+            conn.execute("DELETE FROM members WHERE group_id=? AND user_id=?", (gid, uid))
+            conn.commit()
+            conn.close()
+
+            if g["tg_chat_id"]:
+                try:
+                    await bot.ban_chat_member(chat_id=int(g["tg_chat_id"]), user_id=uid)
+                    await bot.unban_chat_member(chat_id=int(g["tg_chat_id"]), user_id=uid)
+                except Exception:
+                    pass
+            try:
+                await bot.send_message(uid, f"⛔️ Siz <b>{safe_pdf_text(g['name'])}</b> guruhidan chiqarildingiz (davomat limitiga yetdi).")
+            except Exception:
+                pass
+            kicked += 1
+
+    return {"ok": True, "inserted": inserted, "absent": len(absent), "sent": sent, "kicked": kicked}
+
 @router.callback_query(F.data.startswith("a:att_send:"))
 async def a_att_send(call: CallbackQuery):
     if not await guard(call, "attendance"):
@@ -1437,67 +1922,33 @@ async def a_att_send(call: CallbackQuery):
     _, _, gid, d = call.data.split(":")
     gid = int(gid)
 
-    conn = db()
-    g = conn.execute("SELECT name, tg_chat_id, att_absent_limit FROM groups WHERE id=?", (gid,)).fetchone()
-    conn.close()
-    if not g:
-        await call.answer("Guruh topilmadi.", show_alert=True)
+    res = await finalize_attendance_day(call.bot, gid, d, saved_by=call.from_user.id, send_dm=True)
+    if not res.get("ok"):
+        await call.answer("Xatolik.", show_alert=True)
         return
 
-    studs = group_students(gid)
-    amap = attendance_map(gid, d)
-    absent = [(uid, nm) for uid, nm in studs if amap.get(uid, "present") == "absent"]
+    msg = f"✅ Yuborildi: {res['sent']} ta\n📌 Yo‘qlar: {res['absent']} ta"
+    msg += "\n🗂 Arxivga saqlandi." if res.get("inserted") else "\nℹ️ Bu sana avval saqlangan."
+    if res.get("kicked"):
+        msg += f"\n⛔️ Kick: {res['kicked']}"
+    await call.answer(msg, show_alert=True)
 
-    sent = 0
-    for uid, nm in absent:
-        # increment absent counter
-        conn = db()
-        conn.execute("INSERT OR IGNORE INTO counters(group_id, user_id, absent_count, missed_task_count) VALUES (?,?,0,0)",
-                     (gid, uid))
-        conn.execute("UPDATE counters SET absent_count = absent_count + 1 WHERE group_id=? AND user_id=?", (gid, uid))
-        row = conn.execute("SELECT absent_count FROM counters WHERE group_id=? AND user_id=?", (gid, uid)).fetchone()
-        conn.commit()
-        conn.close()
+@router.callback_query(F.data.startswith("a:att_save:"))
+async def a_att_save(call: CallbackQuery):
+    if not await guard(call, "attendance"):
+        return
+    _, _, gid, d = call.data.split(":")
+    gid = int(gid)
 
-        cnt_abs = int(row["absent_count"]) if row else 0
-        limit = int(g["att_absent_limit"])
+    res = await finalize_attendance_day(call.bot, gid, d, saved_by=call.from_user.id, send_dm=False)
+    if not res.get("ok"):
+        await call.answer("Xatolik.", show_alert=True)
+        return
 
-        # DM user
-        try:
-            await call.bot.send_message(
-                uid,
-                f"🗓 <b>Davomat ogohlantirish</b>\n"
-                f"Guruh: <b>{safe_pdf_text(g['name'])}</b>\n"
-                f"Sana: <code>{d}</code>\n\n"
-                f"Siz bugun darsga kelmadingiz ❌\n"
-                f"Sababsiz qoldirish: <b>{cnt_abs}/{limit}</b>"
-            )
-            sent += 1
-        except:
-            pass
-
-        # auto-kick if exceeded
-        if cnt_abs >= limit:
-            # remove from DB
-            conn = db()
-            conn.execute("DELETE FROM members WHERE group_id=? AND user_id=?", (gid, uid))
-            conn.commit()
-            conn.close()
-
-            # kick from telegram group if possible
-            if g["tg_chat_id"]:
-                try:
-                    await call.bot.ban_chat_member(chat_id=int(g["tg_chat_id"]), user_id=uid)
-                    await call.bot.unban_chat_member(chat_id=int(g["tg_chat_id"]), user_id=uid)
-                except:
-                    pass
-            try:
-                await call.bot.send_message(uid, f"⛔️ Siz <b>{safe_pdf_text(g['name'])}</b> guruhidan chiqarildingiz (davomat limiti oshdi).")
-            except:
-                pass
-
-    await call.answer(f"Yuborildi: {sent} ta", show_alert=True)
-    await a_g_att_menu(call)
+    if res.get("inserted"):
+        await call.answer("✅ Davomat saqlandi va arxivga qo‘shildi.", show_alert=True)
+    else:
+        await call.answer("ℹ️ Bu sana avval saqlangan.", show_alert=True)
 
 @router.callback_query(F.data.startswith("a:att_arc:"))
 async def a_att_archive(call: CallbackQuery):
@@ -1505,27 +1956,38 @@ async def a_att_archive(call: CallbackQuery):
         return
     gid = int(call.data.split(":")[2])
     conn = db()
+    ensure_attendance_schema(conn)
     g = conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
-    dates = conn.execute("""
-        SELECT DISTINCT att_date FROM attendance WHERE group_id=? ORDER BY att_date DESC LIMIT 30
-    """, (gid,)).fetchall()
+    
+    try:
+        dates = conn.execute("SELECT att_date FROM attendance_days WHERE group_id=? ORDER BY att_date DESC LIMIT 60", (gid,)).fetchall()
+    except Exception as e:
+        if "attendance_days" in str(e):
+            ensure_attendance_schema(conn)
+            dates = conn.execute("SELECT att_date FROM attendance_days WHERE group_id=? ORDER BY att_date DESC LIMIT 60", (gid,)).fetchall()
+        else:
+            raise
+
     conn.close()
+
     if not g:
         await call.answer("Guruh topilmadi.", show_alert=True)
         return
 
-    kb_rows = []
+    rows = []
     for r in dates:
         d = r["att_date"]
-        kb_rows.append([InlineKeyboardButton(text=f"📅 {d}", callback_data=f"a:att_rep:{gid}:{d}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g_att:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+        rows.append([InlineKeyboardButton(text=f"🗓 {d}", callback_data=f"a:att:{gid}:{d}")])
 
-    await safe_edit(call, f"🗂 <b>Davomat arxivi</b>\nGuruh: <b>{safe_pdf_text(g['name'])}</b>", InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    if not rows:
+        rows.append([InlineKeyboardButton(text="(Arxiv bo‘sh)", callback_data="noop")])
 
-# =========================
-# ADMIN: TESTS (create + assign)
-# =========================
+    rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g_att:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+
+    await safe_edit(call,
+                    f"🗂 <b>Davomat arxivi</b>\nGuruh: <b>{safe_pdf_text(g['name'])}</b>\n\nSaqlangan sanalar:",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
 @router.callback_query(F.data == "a:tests")
 async def a_tests(call: CallbackQuery):
     if not await guard(call, "tests"):
@@ -1694,8 +2156,7 @@ async def a_g_tests(call: CallbackQuery):
         icon = "🟢" if st == "active" else "⏸" if st == "paused" else "🏁"
         kb_rows.append([InlineKeyboardButton(text=f"{icon} {t['test_id']}", callback_data=f"a:t:{t['test_id']}")])
     kb_rows.append([InlineKeyboardButton(text="➕ Test yaratish", callback_data="a:t_add")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"🧪 <b>{safe_pdf_text(g['name'])}</b> — Testlar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -1731,8 +2192,7 @@ async def a_t_opt(call: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="📥 Reyting (PDF)", callback_data=f"a:t_pdf:{tid}")])
     if st != "finished":
         kb_rows.append([InlineKeyboardButton(text="🔁 Biriktirish", callback_data=f"a:t_reassign:{tid}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:tests")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:tests"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     text = (f"⚙️ <b>Test</b>: <code>{tid}</code>\n"
             f"Holat: <b>{st}</b>\n"
@@ -1797,7 +2257,7 @@ async def a_t_rate(call: CallbackQuery):
 
     text = f"🏆 <b>Reyting</b> — <code>{tid}</code>\nHolat: <b>{st}</b> | ⏰ <code>{dl}</code>\n\n"
     for i, r in enumerate(rows, 1):
-        text += f"{i}. {safe_pdf_text(r['full_name'])} — <b>{r['percent']:.1f}%</b> | {r['date']}\n"
+        text += f"{i}. {safe_pdf_text(r['full_name'])} — <b>{r['percent']:.1f}%</b> | {to_uz_time_str(r['date'])}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 PDF", callback_data=f"a:t_pdf:{tid}")],
@@ -1805,30 +2265,6 @@ async def a_t_rate(call: CallbackQuery):
         [InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")],
     ])
     await safe_edit(call, text, kb)
-
-@router.callback_query(F.data.startswith("a:t_pdf:"))
-async def a_t_pdf(call: CallbackQuery):
-    if not await guard(call, "tests"):
-        return
-    tid = call.data.split(":")[2]
-
-    conn = db()
-    rows = conn.execute("""SELECT full_name, percent, date
-                           FROM results WHERE test_id=?
-                           ORDER BY percent DESC""", (tid,)).fetchall()
-    conn.close()
-    if not rows:
-        await call.answer("Natija yo‘q.", show_alert=True)
-        return
-
-    fname = f"rating_{tid}.pdf"
-    pdf_rows = [(r["full_name"], int(r["score"]), int(r["total"]), float(r["percent"]), r["date"]) for r in rows]
-    pdf_rating(fname, f"Reyting — Test {tid}", pdf_rows)
-    try:
-        await call.message.answer_document(FSInputFile(fname))
-    finally:
-        try: os.remove(fname)
-        except: pass
 
 @router.callback_query(F.data.startswith("a:t_reassign:"))
 async def a_t_reassign(call: CallbackQuery, state: FSMContext):
@@ -2018,8 +2454,7 @@ async def a_g_tasks(call: CallbackQuery):
         st = t["status"]
         icon = "🟡" if st == "draft" else "🟢" if st == "published" else "🏁"
         kb_rows.append([InlineKeyboardButton(text=f"{icon} {t['title'][:18]}", callback_data=f"a:task_v:{gid}:{t['id']}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"📌 <b>{safe_pdf_text(g['name'])}</b> — Vazifalar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -2391,10 +2826,7 @@ async def a_task_grade_finish(message: Message, state: FSMContext):
         pass
 
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:task_sub_v:{sub_id}")],
-        [InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")],
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:task_sub_v:{sub_id}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")]])
     await message.answer("✅ Saqlandi va o‘quvchiga yuborildi.", reply_markup=kb)
 
 
@@ -2466,8 +2898,7 @@ async def u_tasks(call: CallbackQuery):
             text=f"📝 {t['title'][:18]}",
             callback_data=f"u:task_v:{gid}:{t['id']}"
         )])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
 
     await safe_edit(call, f"📌 <b>{safe_pdf_text(g['name'])}</b> — Vazifalar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -2793,15 +3224,29 @@ async def cmd_cancel(message: Message, state: FSMContext):
 # STARTUP TASKS
 # =========================
 async def on_startup(bot: Bot):
-    # periodic enforcement
+    # periodic enforcement (kick limits, missed tasks, etc.)
     async def loop_kick():
         while True:
             try:
                 await enforce_kick_limits(bot)
-            except:
+            except Exception:
                 pass
             await asyncio.sleep(300)
+
+    # daily DB backup to admins at 06:00 Asia/Samarkand
+    async def loop_daily_backup():
+        while True:
+            try:
+                wait_s = seconds_until_local_time("Asia/Samarkand", 6, 0)
+                await asyncio.sleep(wait_s)
+                await send_db_backup_to_admins(bot, reason="daily 06:00")
+            except Exception:
+                # if something fails, don't crash the bot
+                await asyncio.sleep(300)
+
     asyncio.create_task(loop_kick())
+    asyncio.create_task(loop_daily_backup())
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -2981,10 +3426,7 @@ async def u_group_tests(call: CallbackQuery):
 
     rows = tests_for_user_in_group(uid, gid)
     if not rows:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")],
-            [InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")],
-        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")]])
         await safe_edit(call, "Bu guruhda hozircha test yo‘q.", kb)
         return
 
@@ -2996,8 +3438,7 @@ async def u_group_tests(call: CallbackQuery):
             text=f"{icon} {r['test_id']} ({status})",
             callback_data=f"u:solve_tid:{r['test_id']}"
         )])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
     await safe_edit(call, f"🧪 <b>{safe_pdf_text(g['name'])}</b> — Testlar:", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 # =========================
@@ -3286,8 +3727,7 @@ async def a_g_students(call: CallbackQuery):
     for i, s in enumerate(students, 1):
         text += f"{i}. {safe_pdf_text(s['full_name'])}\n"
         kb_rows.append([InlineKeyboardButton(text=f"❌ {s['full_name'][:18]}", callback_data=f"a:g_kick:{gid}:{s['user_id']}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -3482,11 +3922,10 @@ async def a_g_att_menu(call: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="📄 Hisobot (text)", callback_data=f"a:att_rep:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="📥 Hisobot (PDF)", callback_data=f"a:att_pdf:{gid}:{d}")])
     kb_rows.append([InlineKeyboardButton(text="🗂 Arxiv", callback_data=f"a:att_arc:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"🗓 <b>Davomat</b>\nGuruh: <b>{safe_pdf_text(g['name'])}</b>\nSana: <code>{d}</code>\n\n"
-                          f"Faqat kelmaganlarni ❌ qilib belgilang.", InlineKeyboardMarkup(inline_keyboard=kb_rows))
+                          f"Faqat qatnashmaganlarni ❌ qilib belgilang.", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 @router.callback_query(F.data.startswith("a:att_t:"))
 async def a_att_toggle(call: CallbackQuery):
@@ -3538,15 +3977,15 @@ async def a_att_report_text(call: CallbackQuery):
             f"Guruh: <b>{safe_pdf_text(g['name'])}</b>\n"
             f"Sana: <code>{d}</code>\n\n"
             f"Jami: <b>{len(studs)}</b>\n"
-            f"✅ Keldi: <b>{present}</b>\n"
-            f"❌ Kelmadi: <b>{len(absent)}</b>\n\n")
+            f"✅ Qatnashdi: <b>{present}</b>\n"
+            f"❌ Qatnashmadi: <b>{len(absent)}</b>\n\n")
 
     if absent:
-        text += "❌ <b>KELMAGANLAR:</b>\n"
+        text += "❌ <b>QATNASHMAGANLAR:</b>\n"
         for i, (_uid, nm) in enumerate(absent, 1):
             text += f"{i}. {safe_pdf_text(nm)}\n"
     else:
-        text += "✅ Bugun hamma kelgan."
+        text += "✅ Bugun hamma qatnashgan."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 PDF", callback_data=f"a:att_pdf:{gid}:{d}")],
@@ -3622,7 +4061,7 @@ async def a_att_send(call: CallbackQuery):
                 f"🗓 <b>Davomat ogohlantirish</b>\n"
                 f"Guruh: <b>{safe_pdf_text(g['name'])}</b>\n"
                 f"Sana: <code>{d}</code>\n\n"
-                f"Siz bugun darsga kelmadingiz ❌\n"
+                f"Siz bugun darsga qatnashmadingiz ❌\n"
                 f"Sababsiz qoldirish: <b>{cnt_abs}/{limit}</b>"
             )
             sent += 1
@@ -3671,8 +4110,7 @@ async def a_att_archive(call: CallbackQuery):
     for r in dates:
         d = r["att_date"]
         kb_rows.append([InlineKeyboardButton(text=f"📅 {d}", callback_data=f"a:att_rep:{gid}:{d}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g_att:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g_att:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"🗂 <b>Davomat arxivi</b>\nGuruh: <b>{safe_pdf_text(g['name'])}</b>", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -3847,8 +4285,7 @@ async def a_g_tests(call: CallbackQuery):
         icon = "🟢" if st == "active" else "⏸" if st == "paused" else "🏁"
         kb_rows.append([InlineKeyboardButton(text=f"{icon} {t['test_id']}", callback_data=f"a:t:{t['test_id']}")])
     kb_rows.append([InlineKeyboardButton(text="➕ Test yaratish", callback_data="a:t_add")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"🧪 <b>{safe_pdf_text(g['name'])}</b> — Testlar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -3884,8 +4321,7 @@ async def a_t_opt(call: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="📥 Reyting (PDF)", callback_data=f"a:t_pdf:{tid}")])
     if st != "finished":
         kb_rows.append([InlineKeyboardButton(text="🔁 Biriktirish", callback_data=f"a:t_reassign:{tid}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:tests")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data="a:tests"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     text = (f"⚙️ <b>Test</b>: <code>{tid}</code>\n"
             f"Holat: <b>{st}</b>\n"
@@ -3950,7 +4386,7 @@ async def a_t_rate(call: CallbackQuery):
 
     text = f"🏆 <b>Reyting</b> — <code>{tid}</code>\nHolat: <b>{st}</b> | ⏰ <code>{dl}</code>\n\n"
     for i, r in enumerate(rows, 1):
-        text += f"{i}. {safe_pdf_text(r['full_name'])} — <b>{r['percent']:.1f}%</b> | {r['date']}\n"
+        text += f"{i}. {safe_pdf_text(r['full_name'])} — <b>{r['percent']:.1f}%</b> | {to_uz_time_str(r['date'])}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 PDF", callback_data=f"a:t_pdf:{tid}")],
@@ -3966,22 +4402,48 @@ async def a_t_pdf(call: CallbackQuery):
     tid = call.data.split(":")[2]
 
     conn = db()
-    rows = conn.execute("""SELECT full_name, percent, date
-                           FROM results WHERE test_id=?
-                           ORDER BY percent DESC""", (tid,)).fetchall()
-    conn.close()
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(results)").fetchall()]
+        has_score = "score" in cols
+        has_total = "total" in cols
+        has_date = "date" in cols
+
+        select_cols = ["full_name", "percent"]
+        if has_score:
+            select_cols.append("score")
+        if has_total:
+            select_cols.append("total")
+        if has_date:
+            select_cols.append("date")
+
+        q = f"SELECT {', '.join(select_cols)} FROM results WHERE test_id=? ORDER BY percent DESC"
+        rows = conn.execute(q, (tid,)).fetchall()
+    finally:
+        conn.close()
+
     if not rows:
         await call.answer("Natija yo‘q.", show_alert=True)
         return
 
     fname = f"rating_{tid}.pdf"
-    pdf_rows = [(r["full_name"], int(r["score"]), int(r["total"]), float(r["percent"]), r["date"]) for r in rows]
+    pdf_rows: List[Tuple[str, int, int, float, str]] = []
+    for r in rows:
+        name = r["full_name"]
+        percent = float(r["percent"] or 0)
+        score = int(r["score"] or 0) if has_score else 0
+        total = int(r["total"] or 0) if has_total else 0
+        date_raw = r["date"] if has_date and r["date"] else ""
+        date_s = to_uz_time_str(date_raw) if date_raw else ""
+        pdf_rows.append((name, score, total, percent, date_s))
+
     pdf_rating(fname, f"Reyting — Test {tid}", pdf_rows)
     try:
         await call.message.answer_document(FSInputFile(fname))
     finally:
-        try: os.remove(fname)
-        except: pass
+        try:
+            os.remove(fname)
+        except Exception:
+            pass
 
 @router.callback_query(F.data.startswith("a:t_reassign:"))
 async def a_t_reassign(call: CallbackQuery, state: FSMContext):
@@ -4171,8 +4633,7 @@ async def a_g_tasks(call: CallbackQuery):
         st = t["status"]
         icon = "🟡" if st == "draft" else "🟢" if st == "published" else "🏁"
         kb_rows.append([InlineKeyboardButton(text=f"{icon} {t['title'][:18]}", callback_data=f"a:task_v:{gid}:{t['id']}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")])
 
     await safe_edit(call, f"📌 <b>{safe_pdf_text(g['name'])}</b> — Vazifalar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -4563,10 +5024,7 @@ async def a_task_grade_finish(message: Message, state: FSMContext):
         pass
 
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:task_sub_v:{sub_id}")],
-        [InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")],
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"a:task_sub_v:{sub_id}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="a:home")]])
     await message.answer("✅ Saqlandi va o‘quvchiga yuborildi.", reply_markup=kb)
 
 
@@ -4638,8 +5096,7 @@ async def u_tasks(call: CallbackQuery):
             text=f"📝 {t['title'][:18]}",
             callback_data=f"u:task_v:{gid}:{t['id']}"
         )])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}")])
-    kb_rows.append([InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Ortga", callback_data=f"u:g:{gid}"), InlineKeyboardButton(text="🏠 Menyu", callback_data="u:home")])
 
     await safe_edit(call, f"📌 <b>{safe_pdf_text(g['name'])}</b> — Vazifalar", InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -4924,7 +5381,52 @@ async def on_startup(bot: Bot):
 # =========================
 # MAIN (single entrypoint)
 # =========================
+async def start_health_server():
+    """
+    Koyeb Web Service uses TCP health checks on $PORT (often 8000).
+    We open the port using only stdlib (no extra deps) so the instance stays healthy.
+    """
+    port = int(os.environ.get("PORT", "8000"))
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            # Read (and ignore) the request. Keep it small to avoid hangs.
+            await reader.read(1024)
+
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                b"ok"
+            )
+            writer.write(resp)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, host="0.0.0.0", port=port)
+    logging.info("Health server listening on 0.0.0.0:%s", port)
+    return server
+
+
+# =========================
+# MAIN (single entrypoint)
+# =========================
 async def main():
+    if not API_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set. Set environment variable BOT_TOKEN (or DB_PATH for DB).")
+
+    # Start health server (for Koyeb web service) - does not affect bot logic.
+    _health_server = await start_health_server()
+
     bot = Bot(
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
