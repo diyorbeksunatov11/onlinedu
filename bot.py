@@ -5390,9 +5390,12 @@ async def start_health_server():
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            # Read (and ignore) the request. Keep it small to avoid hangs.
-            await reader.read(1024)
-
+            # Don't block waiting for request bytes; health checks may only open TCP.
+            try:
+                await asyncio.wait_for(reader.read(16), timeout=0.2)
+            except Exception:
+                pass
+        
             resp = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -5411,7 +5414,6 @@ async def start_health_server():
                 await writer.wait_closed()
             except Exception:
                 pass
-
     server = await asyncio.start_server(handle, host="0.0.0.0", port=port)
     logging.info("Health server listening on 0.0.0.0:%s", port)
     return server
